@@ -185,36 +185,30 @@ func handleSelectWhereOrExpr(expr *sqlparser.Expr, topLevel bool, parent *sqlpar
 	return fmt.Sprintf(`{"bool" : {"should" : [%v]}}`, resultStr), nil
 }
 
-func buildComparisonExprRightStr(expr sqlparser.Expr) (string, bool, error) {
+func buildComparisonExprRightStr(expr sqlparser.Expr) (string, error) {
 	var rightStr string
 	var err error
-	var missingCheck = false
 	switch expr.(type) {
 	case *sqlparser.SQLVal:
 		rightStr = sqlparser.String(expr)
 		rightStr = strings.Trim(rightStr, `'`)
 	case *sqlparser.GroupConcatExpr:
-		return "", missingCheck, errors.New("elasticsql: group_concat not supported")
+		return "", errors.New("elasticsql: group_concat not supported")
 	case *sqlparser.FuncExpr:
 		// parse nested
 		funcExpr := expr.(*sqlparser.FuncExpr)
 		rightStr, err = buildNestedFuncStrValue(funcExpr)
 		if err != nil {
-			return "", missingCheck, err
+			return "", err
 		}
 	case *sqlparser.ColName:
-		if strings.ToLower(sqlparser.String(expr)) == "missing" {
-			missingCheck = true
-			return "", missingCheck, nil
-		}
-
-		return "", missingCheck, errors.New("elasticsql: column name on the right side of compare operator is not supported")
+		return "", errors.New("elasticsql: column name on the right side of compare operator is not supported")
 	case sqlparser.ValTuple:
 		rightStr = sqlparser.String(expr)
 	default:
 		// cannot reach here
 	}
-	return rightStr, missingCheck, err
+	return rightStr, err
 }
 
 func unescapeSql(sql, escapeStr string) string {
@@ -240,7 +234,7 @@ func handleSelectWhereComparisonExpr(expr *sqlparser.Expr, topLevel bool, parent
 
 	colNameStr := sqlparser.String(colName)
 	colNameStr = strings.Replace(colNameStr, "`", "", -1)
-	rightStr, missingCheck, err := buildComparisonExprRightStr(comparisonExpr.Right)
+	rightStr, err := buildComparisonExprRightStr(comparisonExpr.Right)
 	if err != nil {
 		return "", err
 	}
@@ -262,22 +256,24 @@ func handleSelectWhereComparisonExpr(expr *sqlparser.Expr, topLevel bool, parent
 	case "<=":
 		resultStr = fmt.Sprintf(`{"range" : {"%v" : {"to" : "%v"}}}`, colNameStr, rightStr)
 	case "=":
+		resultStr = fmt.Sprintf(`{"term" : {"%v" : "%v"}}`, colNameStr, rightStr)
 		// field is missing
-		if missingCheck { // missing was deprecated in 2.2, use exists instead.
-			resultStr = fmt.Sprintf(`{"bool" : {"must_not" : [{"exists":{"field":"%v"}}]}}`, colNameStr)
-		} else {
-			resultStr = fmt.Sprintf(`{"term" : {"%v" : "%v"}}`, colNameStr, rightStr)
-		}
+		//if missingCheck { // missing was deprecated in 2.2, use exists instead.
+		//	resultStr = fmt.Sprintf(`{"bool" : {"must_not" : [{"exists":{"field":"%v"}}]}}`, colNameStr)
+		//} else {
+		//
+		//}
 	case ">":
 		resultStr = fmt.Sprintf(`{"range" : {"%v" : {"gt" : "%v"}}}`, colNameStr, rightStr)
 	case "<":
 		resultStr = fmt.Sprintf(`{"range" : {"%v" : {"lt" : "%v"}}}`, colNameStr, rightStr)
 	case "!=":
-		if missingCheck { // missing was deprecated in 2.2, use exists instead.
-			resultStr = fmt.Sprintf(`{"bool" : {"must" : [{"exists":{"field":"%v"}}]}}`, colNameStr)
-		} else {
-			resultStr = fmt.Sprintf(`{"bool" : {"must_not" : [{"term" : {"%v" : "%v"}}]}}`, colNameStr, rightStr)
-		}
+		resultStr = fmt.Sprintf(`{"bool" : {"must_not" : [{"term" : {"%v" : "%v"}}]}}`, colNameStr, rightStr)
+		//if missingCheck { // missing was deprecated in 2.2, use exists instead.
+		//	resultStr = fmt.Sprintf(`{"bool" : {"must" : [{"exists":{"field":"%v"}}]}}`, colNameStr)
+		//} else {
+		//
+		//}
 	case "in":
 		// the default valTuple is ('1', '2', '3') like
 		// so need to drop the () and replace ' to "
@@ -308,6 +304,34 @@ func handleSelectWhereComparisonExpr(expr *sqlparser.Expr, topLevel bool, parent
 	return resultStr, nil
 }
 
+func handleSelectWhereIsExpr(expr *sqlparser.Expr, topLevel bool, parent *sqlparser.Expr) (string, error) {
+	comparisonExpr := (*expr).(*sqlparser.IsExpr)
+	colName, ok := comparisonExpr.Expr.(*sqlparser.ColName)
+	if !ok {
+		return "", errors.New("elasticsql: invalid comparison expression, the left must be a column name")
+	}
+
+	colNameStr := sqlparser.String(colName)
+	colNameStr = strings.Replace(colNameStr, "`", "", -1)
+
+	var resultStr string
+
+	switch comparisonExpr.Operator {
+	case sqlparser.IsNullStr:
+		resultStr = fmt.Sprintf(`{"bool" : {"must_not" : [{"exists":{"field":"%v"}}]}}`, colNameStr)
+	case sqlparser.IsNotNullStr:
+		resultStr = fmt.Sprintf(`{"bool" : {"must" : [{"exists":{"field":"%v"}}]}}`, colNameStr)
+	default:
+		return "", errors.New("elasticsql: is expression is not supported now")
+	}
+
+	if topLevel {
+		resultStr = fmt.Sprintf(`{"bool" : {"must" : [%v]}}`, resultStr)
+	}
+
+	return resultStr, nil
+}
+
 func handleSelectWhere(expr *sqlparser.Expr, topLevel bool, parent *sqlparser.Expr) (string, error) {
 	if expr == nil {
 		return "", errors.New("elasticsql: error expression cannot be nil here")
@@ -323,7 +347,7 @@ func handleSelectWhere(expr *sqlparser.Expr, topLevel bool, parent *sqlparser.Ex
 		return handleSelectWhereComparisonExpr(expr, topLevel, parent)
 
 	case *sqlparser.IsExpr:
-		return "", errors.New("elasticsql: is expression currently not supported")
+		return handleSelectWhereIsExpr(expr, topLevel, parent)
 	case *sqlparser.RangeCond:
 		// between a and b
 		// the meaning is equal to range query
